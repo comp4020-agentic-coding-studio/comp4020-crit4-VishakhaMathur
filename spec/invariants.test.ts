@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 
@@ -9,18 +9,22 @@ import { describe, expect, it } from "vitest";
 // week-specific contracts live in your own spec/*.test.ts alongside this file.
 const DIST = resolve("dist");
 
-function htmlFiles(dir: string = DIST): string[] {
+function files(dir: string = DIST): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const path = join(dir, entry.name);
-    if (entry.isDirectory()) return htmlFiles(path);
-    return entry.name.endsWith(".html") ? [path] : [];
+    return entry.isDirectory() ? files(path) : [path];
   });
 }
 
-const pages = htmlFiles().map((path) => ({
-  name: relative(DIST, path),
-  doc: new JSDOM(readFileSync(path, "utf8")).window.document,
-}));
+// Everything the build emitted, as dist-relative POSIX paths.
+const shipped = files().map((path) => relative(DIST, path).split(sep).join("/"));
+
+const pages = shipped
+  .filter((name) => name.endsWith(".html"))
+  .map((name) => ({
+    name,
+    doc: new JSDOM(readFileSync(join(DIST, name), "utf8")).window.document,
+  }));
 
 describe("invariants: every page", () => {
   it("built at least one page", () => {
@@ -35,6 +39,29 @@ describe("invariants: every page", () => {
 
       it("has a real title", () => {
         expect(doc.title.trim()).not.toBe("");
+      });
+
+      it("has a meta description", () => {
+        const description = doc
+          .querySelector('meta[name="description"]')
+          ?.getAttribute("content")
+          ?.trim();
+        expect(
+          description,
+          "a search result and a link preview both read this page's description",
+        ).toBeTruthy();
+      });
+
+      it("has an og:image card", () => {
+        // presence only: whether the path resolves shows up in the gallery
+        const card = doc
+          .querySelector('meta[property="og:image"]')
+          ?.getAttribute("content")
+          ?.trim();
+        expect(
+          card,
+          "with no card image, a shared link renders as a bare row of text",
+        ).toBeTruthy();
       });
 
       it("has a mobile viewport", () => {

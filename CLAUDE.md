@@ -18,10 +18,18 @@ which deliverable applies. Read both before you plan or build.
 - When a check fails, read its output before you change anything.
 - Never commit a red state.
 
+## The link-preview card
+
+`public/card.png` (1200x630) is the image a shared link shows; `index.html`'s
+head points at it. Replace it and the `description` meta, and copy the head
+block into any new page. The card URL resolves against the page that names it,
+like any link --- `./card.png` is wrong one directory down, and nothing in CI
+checks it, so look at the deployed head when you add pages.
+
 ## The checks
 
-`typecheck`, `build`, `deploy`, `spec`, `lint`, `tests`, `evidence`, `links`,
-`secrets`. Run `pnpm check`. Read the failure.
+`pnpm check` runs them (`pnpm check:evidence` is the extra gate before you
+ship); CI runs the same plus links, secrets and the deploy. Read the failure.
 
 `spec/README.md`, `PROCESS.md` and `reflections/README.md` are in this repo and
 say what they are for.
@@ -29,6 +37,6 @@ say what they are for.
 ## This file is yours
 
 A starting point, not a rulebook. As you learn what your prototype needs --- a
-convention the work has to hold to, a sensor that keeps catching you out, a fact
-about the stack that is easy to get wrong --- write it down here. Growing this
-file is the work.
+convention the work has to hold to, a sensor that keeps catching you out (a
+linter, say), a fact about the stack that is easy to get wrong --- write it down
+here and wire it into `check`. Growing this file is the work.

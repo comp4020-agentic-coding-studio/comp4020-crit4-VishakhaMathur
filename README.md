@@ -27,9 +27,10 @@ for the details.
 ```sh
 mise install       # supported path: install the template's Node and pnpm
 pnpm install
-pnpm dev        # local dev server
-pnpm check      # most of what CI runs (links, secrets, evidence and deploy are CI-only)
-pnpm build      # produce dist/ (what gets deployed)
+pnpm dev             # local dev server
+pnpm check           # most of what CI runs (links, secrets and deploy are CI-only)
+pnpm check:evidence  # the process-evidence check CI runs before you ship
+pnpm build           # produce dist/ (what gets deployed)
 
 # reproduce CI's links check before you push
 pnpm dlx linkinator ./dist --silent --skip "^https?://(?!localhost|127)"
@@ -58,12 +59,10 @@ problems with mise.
   like an API key, so your COMP4020 key can't end up in a public repo. Installed
   automatically by `pnpm install`.
 
-This template is SSG-agnostic: it's plain HTML/CSS/TypeScript on Vite, so you
-can add Astro, Eleventy, or any static generator later without changing how it
-deploys. The course plugin's `stack` skill performs the swap for you — to the
-course default (Astro) or stripped to bare HTML/CSS — with the Pages base path,
-lockfile, and CI link check handled. TypeScript is the course default over plain
-JavaScript: the types are extra backpressure, and they catch a false claim in
-the code before you do.
+This template is SSG-agnostic: plain HTML/CSS/TypeScript on Vite, so you can add
+Astro, Eleventy, or any static generator later without changing how it deploys.
+The course plugin's `stack` skill performs the swap for you — to the course
+default (Astro) or bare HTML/CSS — with the Pages base path, lockfile, and CI
+link check handled.
 
 See the course site for how the checks map to each week of the course.
