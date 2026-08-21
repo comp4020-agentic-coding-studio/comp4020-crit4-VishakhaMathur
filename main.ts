@@ -74,36 +74,61 @@ function clamp(value: number, min: number, max: number): number {
 // --- Audio -------------------------------------------------------------
 // A shared graph for the whole page, built lazily on the first pointerdown
 // so AudioContext construction happens inside a user gesture (autoplay
-// policy). Two oscillators --- sine and sawtooth --- run into a shared
-// lowpass filter and out through a master gain:
+// policy). Two oscillators --- sine and triangle, always a perfect fifth
+// apart so they can never clash --- run into a shared lowpass filter, then
+// a master gain, then split into a dry path and an echoing wet path:
 //
-//   sineOsc -> sineGain -\
-//                         +-> filter (lowpass) -> masterGain -> destination
-//   sawOsc  -> sawGain  -/
+//   rootOsc (sine)     -> rootGain  -\
+//                                     +-> filter (lowpass) -> masterGain -+-> destination (dry)
+//   fifthOsc (triangle) -> fifthGain -/                                   |
+//                                                                          +-> echoDelay -> destination (wet)
+//                                                        echoDelay <-> echoFeedback (repeats & decays)
 //
-// Velocity (as in step 2) drives pitch and overall loudness. Y drives the
-// filter cutoff: top of screen open/bright, bottom closed/muffled. X
-// crossfades sine (left) into sawtooth (right).
+// Velocity drives pitch and overall loudness, with a slow swell in and a
+// lazier settle-out so it breathes rather than plucks. Y drives the filter
+// cutoff: top of screen open/bright, bottom closed/muffled. X crossfades the
+// root tone (left) into the fifth harmony (right).
 
 const overlay = document.querySelector<HTMLElement>("#overlay");
 
-const MIN_FREQUENCY = 80;
-const MAX_FREQUENCY = 1200;
+// A warm, narrow rumble-to-hum range instead of a shriek --- 60Hz at rest,
+// never louder or brighter than a gentle 350Hz peak.
+const MIN_FREQUENCY = 60;
+const MAX_FREQUENCY = 350;
 const MAX_GAIN = 0.28;
 const MIN_FILTER_FREQUENCY = 200;
 const MAX_FILTER_FREQUENCY = 9000;
-// Seconds. setTargetAtTime glides every audio param toward its target over
-// roughly this long instead of jumping there --- jumping is what causes the
-// click/pop you get from setting .value directly on a live audio param.
-const AUDIO_TIME_CONSTANT = 0.03;
+// The second oscillator's frequency is always the root's times this ---
+// a perfect fifth, so the two voices are harmonious at any pitch.
+const FIFTH_RATIO = 1.5;
+// Seconds. setTargetAtTime glides continuously-modulated params (pitch,
+// filter cutoff, harmonic mix) toward their target over roughly this long
+// instead of jumping there --- jumping is what causes the click/pop you get
+// from setting .value directly on a live audio param.
+const AUDIO_TIME_CONSTANT = 0.05;
+// Seconds. The master volume's own envelope is slower still and asymmetric:
+// it swells in gently on the attack and lingers even longer on release, so
+// the tone breathes in and out like a wind instrument rather than snapping
+// on and off.
+const GAIN_ATTACK_TIME_CONSTANT = 0.5;
+const GAIN_RELEASE_TIME_CONSTANT = 1.2;
+// Seconds / 0..1. A ~0.4s echo that feeds 35% of itself back into the delay
+// line each pass --- enough repeats to feel lush without ringing on long
+// after the pointer stops.
+const ECHO_DELAY_SECONDS = 0.4;
+const ECHO_FEEDBACK = 0.35;
 
 let audioContext: AudioContext | null = null;
-let sineOscillator: OscillatorNode | null = null;
-let sawOscillator: OscillatorNode | null = null;
-let sineGain: GainNode | null = null;
-let sawGain: GainNode | null = null;
+let rootOscillator: OscillatorNode | null = null;
+let fifthOscillator: OscillatorNode | null = null;
+let rootGain: GainNode | null = null;
+let fifthGain: GainNode | null = null;
 let filter: BiquadFilterNode | null = null;
 let masterGain: GainNode | null = null;
+// Tracks the last gain we asked for, so updateAudio can tell whether the
+// next call is swelling (attack) or settling (release) and pick the right
+// time constant for each.
+let lastGainTarget = 0;
 
 function dismissOverlay(): void {
   if (!overlay || overlay.hidden) return;
@@ -117,18 +142,18 @@ function ensureAudioStarted(): void {
   if (audioContext) return;
   audioContext = new AudioContext();
 
-  sineOscillator = audioContext.createOscillator();
-  sawOscillator = audioContext.createOscillator();
-  sineOscillator.type = "sine";
-  sawOscillator.type = "sawtooth";
-  sineOscillator.frequency.value = MIN_FREQUENCY;
-  sawOscillator.frequency.value = MIN_FREQUENCY;
+  rootOscillator = audioContext.createOscillator();
+  fifthOscillator = audioContext.createOscillator();
+  rootOscillator.type = "sine";
+  fifthOscillator.type = "triangle";
+  rootOscillator.frequency.value = MIN_FREQUENCY;
+  fifthOscillator.frequency.value = MIN_FREQUENCY * FIFTH_RATIO;
 
-  // Far left = pure sine, far right = pure sawtooth.
-  sineGain = audioContext.createGain();
-  sawGain = audioContext.createGain();
-  sineGain.gain.value = 1;
-  sawGain.gain.value = 0;
+  // Far left = pure root tone, far right = pure fifth harmony.
+  rootGain = audioContext.createGain();
+  fifthGain = audioContext.createGain();
+  rootGain.gain.value = 1;
+  fifthGain.gain.value = 0;
 
   filter = audioContext.createBiquadFilter();
   filter.type = "lowpass";
@@ -137,12 +162,25 @@ function ensureAudioStarted(): void {
   masterGain = audioContext.createGain();
   masterGain.gain.value = 0;
 
-  sineOscillator.connect(sineGain).connect(filter);
-  sawOscillator.connect(sawGain).connect(filter);
-  filter.connect(masterGain).connect(audioContext.destination);
+  const echoDelay = audioContext.createDelay(1);
+  echoDelay.delayTime.value = ECHO_DELAY_SECONDS;
+  const echoFeedback = audioContext.createGain();
+  echoFeedback.gain.value = ECHO_FEEDBACK;
 
-  sineOscillator.start();
-  sawOscillator.start();
+  rootOscillator.connect(rootGain).connect(filter);
+  fifthOscillator.connect(fifthGain).connect(filter);
+  filter.connect(masterGain);
+
+  // Dry signal straight to the speakers, plus a wet copy through the delay
+  // --- which feeds its own output back into itself, so each echo triggers
+  // the next, progressively quieter one.
+  masterGain.connect(audioContext.destination);
+  masterGain.connect(echoDelay);
+  echoDelay.connect(echoFeedback).connect(echoDelay);
+  echoDelay.connect(audioContext.destination);
+
+  rootOscillator.start();
+  fifthOscillator.start();
 }
 
 function clamp01(n: number): number {
@@ -150,29 +188,37 @@ function clamp01(n: number): number {
 }
 
 function updateAudio(point: Point, pxPerMs: number): void {
-  if (!audioContext || !sineOscillator || !sawOscillator) return;
-  if (!sineGain || !sawGain || !filter || !masterGain) return;
+  if (!audioContext || !rootOscillator || !fifthOscillator) return;
+  if (!rootGain || !fifthGain || !filter || !masterGain) return;
   const now = audioContext.currentTime;
 
   const velocityT = Math.min(pxPerMs / MAX_VELOCITY, 1);
   const frequency = MIN_FREQUENCY + velocityT * (MAX_FREQUENCY - MIN_FREQUENCY);
-  sineOscillator.frequency.setTargetAtTime(frequency, now, AUDIO_TIME_CONSTANT);
-  sawOscillator.frequency.setTargetAtTime(frequency, now, AUDIO_TIME_CONSTANT);
-  masterGain.gain.setTargetAtTime(velocityT * MAX_GAIN, now, AUDIO_TIME_CONSTANT);
+  rootOscillator.frequency.setTargetAtTime(frequency, now, AUDIO_TIME_CONSTANT);
+  fifthOscillator.frequency.setTargetAtTime(frequency * FIFTH_RATIO, now, AUDIO_TIME_CONSTANT);
+
+  // Whichever direction the gain is heading picks the time constant, so it
+  // swells in gently but lingers even longer as it fades.
+  const targetGain = velocityT * MAX_GAIN;
+  const gainTimeConstant =
+    targetGain >= lastGainTarget ? GAIN_ATTACK_TIME_CONSTANT : GAIN_RELEASE_TIME_CONSTANT;
+  masterGain.gain.setTargetAtTime(targetGain, now, gainTimeConstant);
+  lastGainTarget = targetGain;
 
   // y = 0 at the top of the screen: invert so top is open/bright.
   const openness = 1 - clamp01(point.y / height);
   const cutoff = MIN_FILTER_FREQUENCY + openness * (MAX_FILTER_FREQUENCY - MIN_FILTER_FREQUENCY);
   filter.frequency.setTargetAtTime(cutoff, now, AUDIO_TIME_CONSTANT);
 
-  const sawMix = clamp01(point.x / width);
-  sineGain.gain.setTargetAtTime(1 - sawMix, now, AUDIO_TIME_CONSTANT);
-  sawGain.gain.setTargetAtTime(sawMix, now, AUDIO_TIME_CONSTANT);
+  const fifthMix = clamp01(point.x / width);
+  rootGain.gain.setTargetAtTime(1 - fifthMix, now, AUDIO_TIME_CONSTANT);
+  fifthGain.gain.setTargetAtTime(fifthMix, now, AUDIO_TIME_CONSTANT);
 }
 
 function silenceAudio(): void {
   if (!audioContext || !masterGain) return;
-  masterGain.gain.setTargetAtTime(0, audioContext.currentTime, AUDIO_TIME_CONSTANT);
+  masterGain.gain.setTargetAtTime(0, audioContext.currentTime, GAIN_RELEASE_TIME_CONSTANT);
+  lastGainTarget = 0;
 }
 
 function velocityToWidth(pxPerMs: number): number {
