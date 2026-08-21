@@ -163,8 +163,18 @@ function dismissOverlay(): void {
 }
 
 function ensureAudioStarted(): void {
-  if (audioContext) return;
+  if (audioContext) {
+    // Safari's gesture-unlock heuristic doesn't reliably key off pointer
+    // events the way it does touchstart/mousedown/keydown, so a context
+    // built during a pointerdown can silently stay "suspended" on iOS ---
+    // visuals work, nothing reaches the speakers. Calling resume() again
+    // from any later gesture (this fires on every qualifying event) gets it
+    // unstuck without needing a page reload.
+    if (audioContext.state !== "running") void audioContext.resume();
+    return;
+  }
   audioContext = new AudioContext();
+  void audioContext.resume();
 
   rootOscillator = audioContext.createOscillator();
   fifthOscillator = audioContext.createOscillator();
@@ -370,6 +380,11 @@ canvas.addEventListener("pointerdown", onPointerDown);
 canvas.addEventListener("pointermove", onPointerMove);
 canvas.addEventListener("pointerup", endStroke);
 canvas.addEventListener("pointercancel", endStroke);
+// Belt-and-braces audio unlock: iOS Safari's gesture heuristic is most
+// reliably tied to touchstart, not pointerdown, so touch devices get an
+// extra unlock attempt from the same first touch. ensureAudioStarted is
+// idempotent, so this never double-builds the audio graph.
+canvas.addEventListener("touchstart", ensureAudioStarted, { passive: true });
 
 // --- Keyboard virtual cursor --------------------------------------------
 // Arrow keys and WASD accelerate a virtual cursor instead of jumping it;
