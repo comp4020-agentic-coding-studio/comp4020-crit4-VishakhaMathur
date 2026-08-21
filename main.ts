@@ -67,6 +67,10 @@ function midpoint(a: Point, b: Point): Point {
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
 // --- Audio -------------------------------------------------------------
 // A shared graph for the whole page, built lazily on the first pointerdown
 // so AudioContext construction happens inside a user gesture (autoplay
@@ -142,7 +146,7 @@ function ensureAudioStarted(): void {
 }
 
 function clamp01(n: number): number {
-  return Math.min(Math.max(n, 0), 1);
+  return clamp(n, 0, 1);
 }
 
 function updateAudio(point: Point, pxPerMs: number): void {
@@ -176,6 +180,49 @@ function velocityToWidth(pxPerMs: number): number {
   return MIN_LINE_WIDTH + t * (MAX_LINE_WIDTH - MIN_LINE_WIDTH);
 }
 
+// Starts a stroke's state and leaves the initial mark --- shared by pointer
+// touchdown and the keyboard cursor's first movement, so a tap/keypress
+// that never moves still leaves a dot.
+function startStroke(point: Point, timestamp: number): StrokeState {
+  hueSeed = (hueSeed + 47) % 360;
+  const state: StrokeState = { p0: point, p1: point, t: timestamp, hue: hueSeed, velocity: 0 };
+  ctx.fillStyle = `hsl(${hueSeed}, 85%, 60%)`;
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, MIN_LINE_WIDTH / 2, 0, Math.PI * 2);
+  ctx.fill();
+  return state;
+}
+
+// The unified engine: one stroke moving to one new point, at one moment ---
+// pointer and keyboard input both funnel through this to drive the same
+// audio parameters and draw with the same curve-smoothed line.
+function advanceStroke(state: StrokeState, point: Point, timestamp: number): void {
+  const distance = Math.hypot(point.x - state.p1.x, point.y - state.p1.y);
+  const dt = Math.max(timestamp - state.t, 1);
+  const instantVelocity = distance / dt;
+  state.velocity += (instantVelocity - state.velocity) * VELOCITY_SMOOTHING;
+  state.hue = (state.hue + distance * HUE_PER_PX) % 360;
+  updateAudio(point, state.velocity);
+
+  ctx.strokeStyle = `hsl(${state.hue}, 85%, 60%)`;
+  ctx.lineWidth = velocityToWidth(state.velocity);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(midpoint(state.p0, state.p1).x, midpoint(state.p0, state.p1).y);
+  ctx.quadraticCurveTo(
+    state.p1.x,
+    state.p1.y,
+    midpoint(state.p1, point).x,
+    midpoint(state.p1, point).y,
+  );
+  ctx.stroke();
+
+  state.p0 = state.p1;
+  state.p1 = point;
+  state.t = timestamp;
+}
+
 function toPoint(event: PointerEvent): Point {
   const rect = canvas.getBoundingClientRect();
   return { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -185,20 +232,7 @@ function onPointerDown(event: PointerEvent): void {
   dismissOverlay();
   ensureAudioStarted();
   canvas.setPointerCapture(event.pointerId);
-  hueSeed = (hueSeed + 47) % 360;
-  const point = toPoint(event);
-  strokes.set(event.pointerId, {
-    p0: point,
-    p1: point,
-    t: event.timeStamp,
-    hue: hueSeed,
-    velocity: 0,
-  });
-  // A tap that never moves still leaves a mark.
-  ctx.fillStyle = `hsl(${hueSeed}, 85%, 60%)`;
-  ctx.beginPath();
-  ctx.arc(point.x, point.y, MIN_LINE_WIDTH / 2, 0, Math.PI * 2);
-  ctx.fill();
+  strokes.set(event.pointerId, startStroke(toPoint(event), event.timeStamp));
 }
 
 function onPointerMove(event: PointerEvent): void {
@@ -209,31 +243,7 @@ function onPointerMove(event: PointerEvent): void {
   // so fast strokes on high-polling-rate input still draw an unbroken line.
   const events = event.getCoalescedEvents?.() ?? [];
   for (const raw of events.length > 0 ? events : [event]) {
-    const point = toPoint(raw);
-    const distance = Math.hypot(point.x - state.p1.x, point.y - state.p1.y);
-    const dt = Math.max(raw.timeStamp - state.t, 1);
-    const instantVelocity = distance / dt;
-    state.velocity += (instantVelocity - state.velocity) * VELOCITY_SMOOTHING;
-    state.hue = (state.hue + distance * HUE_PER_PX) % 360;
-    updateAudio(point, state.velocity);
-
-    ctx.strokeStyle = `hsl(${state.hue}, 85%, 60%)`;
-    ctx.lineWidth = velocityToWidth(state.velocity);
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.beginPath();
-    ctx.moveTo(midpoint(state.p0, state.p1).x, midpoint(state.p0, state.p1).y);
-    ctx.quadraticCurveTo(
-      state.p1.x,
-      state.p1.y,
-      midpoint(state.p1, point).x,
-      midpoint(state.p1, point).y,
-    );
-    ctx.stroke();
-
-    state.p0 = state.p1;
-    state.p1 = point;
-    state.t = raw.timeStamp;
+    advanceStroke(state, toPoint(raw), raw.timeStamp);
   }
 }
 
@@ -242,9 +252,9 @@ function endStroke(event: PointerEvent): void {
   if (canvas.hasPointerCapture(event.pointerId)) {
     canvas.releasePointerCapture(event.pointerId);
   }
-  // Only silence once every pointer has lifted --- another one might still
-  // be mid-stroke and driving the shared oscillator.
-  if (strokes.size === 0) silenceAudio();
+  // Only silence once every pointer has lifted and the keyboard cursor
+  // isn't the one keeping things moving.
+  if (strokes.size === 0 && !isKeyboardCursorActive()) silenceAudio();
 }
 
 canvas.addEventListener("pointerdown", onPointerDown);
@@ -252,9 +262,124 @@ canvas.addEventListener("pointermove", onPointerMove);
 canvas.addEventListener("pointerup", endStroke);
 canvas.addEventListener("pointercancel", endStroke);
 
-function fade(): void {
+// --- Keyboard virtual cursor --------------------------------------------
+// Arrow keys and WASD accelerate a virtual cursor instead of jumping it;
+// releasing lets drag coast it to a stop. It shares startStroke/advanceStroke
+// with pointer input, so the trail and the tone behave identically whichever
+// drove them --- only how the (x, y) gets produced each frame differs.
+
+// px/ms^2 --- how hard a held key pushes.
+const KEY_ACCELERATION = 0.004;
+// Fraction of speed shed per ms, applied continuously; the same constant
+// governs both how fast held input reaches cruising speed and how fast it
+// coasts to a stop on release.
+const KEY_FRICTION = 0.0025;
+// Below this speed, with no key held, treat the cursor as fully at rest.
+const KEY_REST_SPEED = 0.01;
+
+const pressedKeys = new Set<string>();
+const keyboardVelocity: Point = { x: 0, y: 0 };
+let keyboardState: StrokeState | null = null;
+let keyboardLastFrameTime: number | null = null;
+
+function normalizeKey(key: string): string {
+  return key.length === 1 ? key.toLowerCase() : key;
+}
+
+function directionForKey(key: string): Point | undefined {
+  switch (key) {
+    case "ArrowUp":
+    case "w":
+      return { x: 0, y: -1 };
+    case "ArrowDown":
+    case "s":
+      return { x: 0, y: 1 };
+    case "ArrowLeft":
+    case "a":
+      return { x: -1, y: 0 };
+    case "ArrowRight":
+    case "d":
+      return { x: 1, y: 0 };
+    default:
+      return undefined;
+  }
+}
+
+function isKeyboardCursorActive(): boolean {
+  return pressedKeys.size > 0 || Math.hypot(keyboardVelocity.x, keyboardVelocity.y) > KEY_REST_SPEED;
+}
+
+window.addEventListener("keydown", (event) => {
+  // Any key --- not just a movement key --- satisfies "press any key to
+  // play", same as the first pointerdown does for pointer input.
+  dismissOverlay();
+  ensureAudioStarted();
+
+  const key = normalizeKey(event.key);
+  if (!directionForKey(key)) return;
+  event.preventDefault(); // arrow keys otherwise scroll the page
+  pressedKeys.add(key);
+});
+
+window.addEventListener("keyup", (event) => {
+  pressedKeys.delete(normalizeKey(event.key));
+});
+
+function updateKeyboardCursor(timestamp: number): void {
+  if (keyboardLastFrameTime === null) {
+    keyboardLastFrameTime = timestamp;
+    return;
+  }
+  const dt = Math.min(timestamp - keyboardLastFrameTime, 100);
+  keyboardLastFrameTime = timestamp;
+
+  let inputX = 0;
+  let inputY = 0;
+  for (const key of pressedKeys) {
+    const direction = directionForKey(key);
+    if (!direction) continue;
+    inputX += direction.x;
+    inputY += direction.y;
+  }
+  const inputMagnitude = Math.hypot(inputX, inputY);
+  if (inputMagnitude > 0) {
+    inputX /= inputMagnitude;
+    inputY /= inputMagnitude;
+  }
+
+  keyboardVelocity.x += inputX * KEY_ACCELERATION * dt;
+  keyboardVelocity.y += inputY * KEY_ACCELERATION * dt;
+
+  const drag = Math.max(0, 1 - KEY_FRICTION * dt);
+  keyboardVelocity.x *= drag;
+  keyboardVelocity.y *= drag;
+
+  const speed = Math.hypot(keyboardVelocity.x, keyboardVelocity.y);
+  if (speed > MAX_VELOCITY) {
+    keyboardVelocity.x *= MAX_VELOCITY / speed;
+    keyboardVelocity.y *= MAX_VELOCITY / speed;
+  }
+
+  if (inputMagnitude === 0 && speed < KEY_REST_SPEED) {
+    keyboardVelocity.x = 0;
+    keyboardVelocity.y = 0;
+    return; // at rest --- nothing new to draw or sound
+  }
+
+  if (!keyboardState) {
+    keyboardState = startStroke({ x: width / 2, y: height / 2 }, timestamp);
+  }
+  const next: Point = {
+    x: clamp(keyboardState.p1.x + keyboardVelocity.x * dt, 0, width),
+    y: clamp(keyboardState.p1.y + keyboardVelocity.y * dt, 0, height),
+  };
+  advanceStroke(keyboardState, next, timestamp);
+}
+
+function tick(timestamp: number): void {
   ctx.fillStyle = `rgba(0, 0, 0, ${FADE_ALPHA})`;
   ctx.fillRect(0, 0, width, height);
-  requestAnimationFrame(fade);
+  updateKeyboardCursor(timestamp);
+  requestAnimationFrame(tick);
 }
-requestAnimationFrame(fade);
+requestAnimationFrame(tick);
