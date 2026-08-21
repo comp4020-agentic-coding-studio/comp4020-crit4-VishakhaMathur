@@ -74,20 +74,24 @@ function clamp(value: number, min: number, max: number): number {
 // --- Audio -------------------------------------------------------------
 // A shared graph for the whole page, built lazily on the first pointerdown
 // so AudioContext construction happens inside a user gesture (autoplay
-// policy). Two oscillators --- sine and triangle, always a perfect fifth
-// apart so they can never clash --- run into a shared lowpass filter, then
-// a master gain, then split into a dry path and an echoing wet path:
+// policy). Two tuned oscillators --- sine and triangle, always a perfect
+// fifth apart --- feed a resonant lowpass filter standing in for an
+// instrument's wooden body; a slow LFO wobbles their pitch like a hand
+// shaking on a string, and a third, quiet sawtooth voice adds the scrape of
+// the bow at speed:
 //
 //   rootOsc (sine)     -> rootGain  -\
-//                                     +-> filter (lowpass) -> masterGain -+-> destination (dry)
-//   fifthOsc (triangle) -> fifthGain -/                                   |
-//                                                                          +-> echoDelay -> destination (wet)
+//   fifthOsc (triangle) -> fifthGain -+-> filter (resonant lowpass) -> masterGain -+-> destination (dry)
+//   bowOsc (sawtooth)  -> bowHighpass -> bowGain -/                                |
+//                                                                                   +-> echoDelay -> destination (wet)
+//   vibratoLfo (sine) -> vibratoDepth -> rootOsc.frequency, fifthOsc.frequency      |
 //                                                        echoDelay <-> echoFeedback (repeats & decays)
 //
-// Velocity drives pitch and overall loudness, with a slow swell in and a
-// lazier settle-out so it breathes rather than plucks. Y drives the filter
-// cutoff: top of screen open/bright, bottom closed/muffled. X crossfades the
-// root tone (left) into the fifth harmony (right).
+// Velocity drives pitch, overall loudness, the bow voice's volume, and ---
+// heavily --- the filter cutoff: slow strokes stay dark and muffled, fast
+// ones rip the filter open into the brighter harmonics and bow scrape. Y
+// nudges the cutoff further: top of screen open/bright, bottom closed/
+// muffled. X crossfades the root tone (left) into the fifth harmony (right).
 
 const overlay = document.querySelector<HTMLElement>("#overlay");
 
@@ -98,9 +102,27 @@ const MAX_FREQUENCY = 350;
 const MAX_GAIN = 0.28;
 const MIN_FILTER_FREQUENCY = 200;
 const MAX_FILTER_FREQUENCY = 9000;
+// How much of the filter's openness comes from velocity vs. from Y position
+// --- velocity should heavily dictate the timbre, Y just leans it further.
+const VELOCITY_TO_FILTER_WEIGHT = 0.65;
+// Resonant peak on the lowpass, between the "gives it body" and "starts to
+// whistle" ends of the usual 5-10 range --- this is what makes the filter
+// sound like a hollow wooden cavity instead of a plain tone-control knob.
+const FILTER_Q = 7;
 // The second oscillator's frequency is always the root's times this ---
 // a perfect fifth, so the two voices are harmonious at any pitch.
 const FIFTH_RATIO = 1.5;
+// Hz / Hz. A slow LFO modulating oscillator frequency by a couple of Hz ---
+// too subtle to sound like pitch-bend, just enough to read as a hand's
+// natural micro-tremor on a bowed string instead of a locked digital tone.
+const VIBRATO_RATE_HZ = 5;
+const VIBRATO_DEPTH_HZ = 2.5;
+// The "bow" voice: a quiet sawtooth pushed through a highpass so only its
+// bright scratchy upper harmonics survive, faded in only once the stroke is
+// moving fast enough to be "bowing" rather than idling.
+const BOW_HIGHPASS_FREQUENCY = 1500;
+const BOW_MAX_GAIN = 0.05;
+const BOW_VELOCITY_THRESHOLD = 0.55;
 // Seconds. setTargetAtTime glides continuously-modulated params (pitch,
 // filter cutoff, harmonic mix) toward their target over roughly this long
 // instead of jumping there --- jumping is what causes the click/pop you get
@@ -123,6 +145,8 @@ let rootOscillator: OscillatorNode | null = null;
 let fifthOscillator: OscillatorNode | null = null;
 let rootGain: GainNode | null = null;
 let fifthGain: GainNode | null = null;
+let bowOscillator: OscillatorNode | null = null;
+let bowGain: GainNode | null = null;
 let filter: BiquadFilterNode | null = null;
 let masterGain: GainNode | null = null;
 // Tracks the last gain we asked for, so updateAudio can tell whether the
@@ -158,9 +182,38 @@ function ensureAudioStarted(): void {
   filter = audioContext.createBiquadFilter();
   filter.type = "lowpass";
   filter.frequency.value = MIN_FILTER_FREQUENCY;
+  filter.Q.value = FILTER_Q;
 
   masterGain = audioContext.createGain();
   masterGain.gain.value = 0;
+
+  // Vibrato: an inaudible-on-its-own LFO whose output is scaled by
+  // vibratoDepth (a gain node used purely as a multiplier here, not as a
+  // volume control) and fed straight into both oscillators' frequency
+  // AudioParams, where it sums with the pitch set in updateAudio.
+  const vibratoLfo = audioContext.createOscillator();
+  vibratoLfo.type = "sine";
+  vibratoLfo.frequency.value = VIBRATO_RATE_HZ;
+  const vibratoDepth = audioContext.createGain();
+  vibratoDepth.gain.value = VIBRATO_DEPTH_HZ;
+  vibratoLfo.connect(vibratoDepth);
+  vibratoDepth.connect(rootOscillator.frequency);
+  vibratoDepth.connect(fifthOscillator.frequency);
+  vibratoLfo.start();
+
+  // Bow friction: pitch-tracks the root tone (set alongside it in
+  // updateAudio) so the scrape reads as part of the same note, not a
+  // separate noise layer.
+  bowOscillator = audioContext.createOscillator();
+  bowOscillator.type = "sawtooth";
+  bowOscillator.frequency.value = MIN_FREQUENCY;
+  const bowHighpass = audioContext.createBiquadFilter();
+  bowHighpass.type = "highpass";
+  bowHighpass.frequency.value = BOW_HIGHPASS_FREQUENCY;
+  bowGain = audioContext.createGain();
+  bowGain.gain.value = 0;
+  bowOscillator.connect(bowHighpass).connect(bowGain).connect(filter);
+  bowOscillator.start();
 
   const echoDelay = audioContext.createDelay(1);
   echoDelay.delayTime.value = ECHO_DELAY_SECONDS;
@@ -188,14 +241,15 @@ function clamp01(n: number): number {
 }
 
 function updateAudio(point: Point, pxPerMs: number): void {
-  if (!audioContext || !rootOscillator || !fifthOscillator) return;
-  if (!rootGain || !fifthGain || !filter || !masterGain) return;
+  if (!audioContext || !rootOscillator || !fifthOscillator || !bowOscillator) return;
+  if (!rootGain || !fifthGain || !bowGain || !filter || !masterGain) return;
   const now = audioContext.currentTime;
 
   const velocityT = Math.min(pxPerMs / MAX_VELOCITY, 1);
   const frequency = MIN_FREQUENCY + velocityT * (MAX_FREQUENCY - MIN_FREQUENCY);
   rootOscillator.frequency.setTargetAtTime(frequency, now, AUDIO_TIME_CONSTANT);
   fifthOscillator.frequency.setTargetAtTime(frequency * FIFTH_RATIO, now, AUDIO_TIME_CONSTANT);
+  bowOscillator.frequency.setTargetAtTime(frequency, now, AUDIO_TIME_CONSTANT);
 
   // Whichever direction the gain is heading picks the time constant, so it
   // swells in gently but lingers even longer as it fades.
@@ -205,8 +259,17 @@ function updateAudio(point: Point, pxPerMs: number): void {
   masterGain.gain.setTargetAtTime(targetGain, now, gainTimeConstant);
   lastGainTarget = targetGain;
 
-  // y = 0 at the top of the screen: invert so top is open/bright.
-  const openness = 1 - clamp01(point.y / height);
+  // The scrape only appears once the stroke is moving fast enough to count
+  // as "bowing" --- below the threshold it stays silent.
+  const bowT = clamp01((velocityT - BOW_VELOCITY_THRESHOLD) / (1 - BOW_VELOCITY_THRESHOLD));
+  bowGain.gain.setTargetAtTime(bowT * BOW_MAX_GAIN, now, AUDIO_TIME_CONSTANT);
+
+  // y = 0 at the top of the screen: invert so top is open/bright. Blended
+  // with velocity, which does most of the work of opening the filter.
+  const heightOpenness = 1 - clamp01(point.y / height);
+  const openness = clamp01(
+    velocityT * VELOCITY_TO_FILTER_WEIGHT + heightOpenness * (1 - VELOCITY_TO_FILTER_WEIGHT),
+  );
   const cutoff = MIN_FILTER_FREQUENCY + openness * (MAX_FILTER_FREQUENCY - MIN_FILTER_FREQUENCY);
   filter.frequency.setTargetAtTime(cutoff, now, AUDIO_TIME_CONSTANT);
 
